@@ -82,6 +82,15 @@ from eight workers, and switched back to native `kyber`. All writes completed;
 the final QueueTopia counters were G=A=C=1088 with B_new=Q_adm=0, and the VM
 powered off cleanly without a kernel BUG, Oops, or panic.
 
+The module path was also tested in a second QEMU guest configured with
+`CONFIG_MODULES=y` and `CONFIG_MQ_IOSCHED_KYBER=m`: it loaded
+`kyber-iosched.ko`, selected `kyber-qt`, completed direct I/O, switched to
+`mq-deadline`, unloaded the module, then loaded it again and repeated the
+selection and I/O successfully. This validates module registration and
+unload/reload in the test guest; it does not make that module binary suitable
+for the host kernel without building against the host's exact source and
+configuration.
+
 This confirms basic boot, scheduler selection, sysfs control, request
 accounting, and virtual block I/O only. The run used a single virtual queue;
 `cap_blocked` remained zero and the adaptive controller stayed in TRACK without
