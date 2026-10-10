@@ -9,8 +9,12 @@
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/hrtimer.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/sbitmap.h>
+#include <linux/string.h>
+#include <linux/workqueue.h>
 
 #include <trace/events/block.h>
 
@@ -50,6 +54,28 @@ enum {
 	 * operations.
 	 */
 	KYBER_ASYNC_PERCENT = 75,
+};
+
+/* QueueTopia state uses elv.priv[1]; Kyber keeps its domain token in priv[0]. */
+enum {
+	KYBER_QT_TRACKED	= BIT(0),
+	KYBER_QT_ADMITTED	= BIT(1),
+	KYBER_QT_RETRY		= BIT(2),
+	KYBER_QT_TERMINAL	= BIT(3),
+};
+
+#define KYBER_QT_CREDIT_UNIT	((u64)NSEC_PER_SEC)
+#define KYBER_QT_DEFAULT_RATE	1000000U
+#define KYBER_QT_DEFAULT_BURST	128U
+#define KYBER_QT_DEFAULT_CAP	128U
+#define KYBER_QT_MAX_RATE	1000000U
+#define KYBER_QT_MAX_BURST	4096U
+#define KYBER_QT_MAX_CAP	65536U
+#define KYBER_QT_MAX_CONFIRM	64U
+
+enum kyber_qt_mode {
+	KYBER_QT_TRACK,
+	KYBER_QT_DRAIN,
 };
 
 /*
@@ -170,6 +196,50 @@ struct kyber_queue_data {
 	/* Timer for stats aggregation and adjusting domain tokens. */
 	struct timer_list timer;
 
+	/* QueueTopia admission state shared by all hardware queues. */
+	spinlock_t qt_lock;
+	struct hrtimer qt_wake_timer;
+	struct hrtimer qt_sample_timer;
+	struct work_struct qt_sample_work;
+	bool qt_enabled;
+	u32 qt_control;		/* 0=observe, 1=fixed gate, 2=adaptive. */
+	bool qt_stopping;
+	u32 qt_rate;		/* First admissions per second. */
+	u32 qt_initial_rate;
+	u32 qt_max_rate;
+	u32 qt_alpha;		/* Recovery increase, requests per second. */
+	u32 qt_beta;		/* Drain multiplier, percent. */
+	u32 qt_epsilon;		/* Growth trigger, requests per second. */
+	u32 qt_confirm;
+	u32 qt_sample_ms;
+	u32 qt_burst;		/* Maximum accumulated rate credits. */
+	u32 qt_cap;		/* Maximum admitted, unterminated requests. */
+	u32 qt_low;
+	u32 qt_high;
+	enum kyber_qt_mode qt_mode;
+	u64 qt_credit;		/* Rate credits scaled by NSEC_PER_SEC. */
+	u64 qt_last_ns;
+	u64 qt_prev_ns;
+	u64 qt_prev_q;
+	u64 qt_sample_elapsed_ns;
+	u64 qt_prev_domain_blocked;
+	s64 qt_growth_rate;
+	bool qt_sample_valid;
+	u32 qt_growth_streak;
+	u32 qt_drain_streak;
+	u64 qt_generated;
+	u64 qt_admitted;
+	u64 qt_completed;
+	u64 qt_exit_new;
+	u64 qt_exit_admitted;
+	u64 qt_rate_blocked;
+	u64 qt_cap_blocked;
+	u64 qt_domain_blocked;
+	u64 qt_requeues;
+	u64 qt_b_new;
+	u64 qt_q_adm;
+	u64 qt_b_retry;
+
 	unsigned int latency_buckets[KYBER_OTHER][2][KYBER_LATENCY_BUCKETS];
 
 	unsigned long latency_timeout[KYBER_OTHER];
@@ -183,6 +253,7 @@ struct kyber_queue_data {
 struct kyber_hctx_data {
 	spinlock_t lock;
 	struct list_head rqs[KYBER_NUM_DOMAINS];
+	struct list_head retry_rqs;
 	unsigned int cur_domain;
 	unsigned int batching;
 	struct kyber_ctx_queue *kcqs;
@@ -191,6 +262,166 @@ struct kyber_hctx_data {
 	struct sbq_wait_state *domain_ws[KYBER_NUM_DOMAINS];
 	atomic_t wait_index[KYBER_NUM_DOMAINS];
 };
+
+static unsigned long kyber_qt_rq_state(struct request *rq)
+{
+	return (unsigned long)rq->elv.priv[1];
+}
+
+static void kyber_qt_set_rq_state(struct request *rq, unsigned long state)
+{
+	rq->elv.priv[1] = (void *)state;
+}
+
+static enum hrtimer_restart kyber_qt_wake_timer_fn(struct hrtimer *timer)
+{
+	struct kyber_queue_data *kqd =
+		container_of(timer, struct kyber_queue_data, qt_wake_timer);
+
+	if (!READ_ONCE(kqd->qt_stopping))
+		blk_mq_run_hw_queues(kqd->q, true);
+
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart kyber_qt_sample_timer_fn(struct hrtimer *timer)
+{
+	struct kyber_queue_data *kqd =
+		container_of(timer, struct kyber_queue_data, qt_sample_timer);
+
+	if (!READ_ONCE(kqd->qt_stopping))
+		schedule_work(&kqd->qt_sample_work);
+
+	return HRTIMER_NORESTART;
+}
+
+static bool kyber_qt_set_rate_locked(struct kyber_queue_data *kqd, u32 rate,
+				     u64 now)
+{
+	if (rate == kqd->qt_rate)
+		return false;
+
+	if (rate < kqd->qt_rate)
+		kqd->qt_credit = 0;
+	kqd->qt_rate = rate;
+	kqd->qt_last_ns = now;
+	return true;
+}
+
+static void kyber_qt_sample_workfn(struct work_struct *work)
+{
+	struct kyber_queue_data *kqd =
+		container_of(work, struct kyber_queue_data, qt_sample_work);
+	unsigned long flags;
+	u64 now = ktime_get_ns();
+	u64 q_adm, b_new, growth = 0, drain_rate = 0, previous_q;
+	u64 domain_blocked, sample_elapsed = 0, sample_period;
+	u32 next_rate, current_rate = 0;
+	s64 growth_rate = 0;
+	bool valid_sample = false, domain_pressure = false;
+	bool rate_changed = false, run_queues = false;
+	bool draining = false;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	if (READ_ONCE(kqd->qt_stopping))
+		goto out;
+
+	q_adm = kqd->qt_q_adm;
+	b_new = kqd->qt_b_new;
+	domain_blocked = kqd->qt_domain_blocked;
+	previous_q = kqd->qt_prev_q;
+	if (kqd->qt_prev_ns && now > kqd->qt_prev_ns) {
+		sample_elapsed = now - kqd->qt_prev_ns;
+		sample_period = (u64)kqd->qt_sample_ms * NSEC_PER_MSEC;
+		valid_sample = sample_elapsed <= 2 * sample_period;
+		if (valid_sample) {
+			if (q_adm > previous_q)
+				growth = div64_u64((q_adm - previous_q) *
+						   NSEC_PER_SEC, sample_elapsed);
+			else if (q_adm < previous_q)
+				drain_rate = div64_u64((previous_q - q_adm) *
+						       NSEC_PER_SEC, sample_elapsed);
+		}
+	}
+	kqd->qt_sample_elapsed_ns = sample_elapsed;
+	kqd->qt_sample_valid = valid_sample;
+	growth_rate = (s64)growth - (s64)drain_rate;
+	kqd->qt_growth_rate = growth_rate;
+	if (valid_sample && growth > kqd->qt_epsilon)
+		kqd->qt_growth_streak = min(kqd->qt_growth_streak + 1,
+					    kqd->qt_confirm);
+	else
+		kqd->qt_growth_streak = 0;
+	if (!valid_sample)
+		kqd->qt_drain_streak = 0;
+	else if (domain_blocked > kqd->qt_prev_domain_blocked)
+		domain_pressure = true;
+
+	if (kqd->qt_control < 2) {
+		kqd->qt_mode = KYBER_QT_TRACK;
+	} else if (q_adm == 0 && b_new == 0) {
+		kqd->qt_mode = KYBER_QT_TRACK;
+		kqd->qt_growth_streak = 0;
+		kqd->qt_drain_streak = 0;
+		rate_changed = kyber_qt_set_rate_locked(kqd,
+							kqd->qt_initial_rate, now);
+	} else if (kqd->qt_mode == KYBER_QT_TRACK) {
+		bool pressure = q_adm >= kqd->qt_high || domain_pressure ||
+			kqd->qt_growth_streak >= kqd->qt_confirm;
+
+		if (pressure) {
+			kqd->qt_mode = KYBER_QT_DRAIN;
+			kqd->qt_drain_streak = 0;
+			next_rate = div_u64((u64)kqd->qt_rate * kqd->qt_beta,
+					    100);
+			next_rate = max_t(u32, next_rate, 1);
+			rate_changed = kyber_qt_set_rate_locked(kqd, next_rate, now);
+		} else if (valid_sample && b_new && q_adm <= kqd->qt_low &&
+			   growth <= kqd->qt_epsilon) {
+			next_rate = kqd->qt_rate + kqd->qt_alpha;
+			next_rate = min(next_rate, kqd->qt_max_rate);
+			rate_changed = kyber_qt_set_rate_locked(kqd, next_rate, now);
+		}
+	} else {
+		if (valid_sample && q_adm <= kqd->qt_low &&
+		    growth <= kqd->qt_epsilon)
+			kqd->qt_drain_streak = min(kqd->qt_drain_streak + 1,
+						   kqd->qt_confirm);
+		else
+			kqd->qt_drain_streak = 0;
+
+		if (kqd->qt_drain_streak >= kqd->qt_confirm) {
+			kqd->qt_mode = KYBER_QT_TRACK;
+			kqd->qt_drain_streak = 0;
+		} else if (valid_sample && q_adm > kqd->qt_low &&
+			   drain_rate <= kqd->qt_epsilon) {
+			next_rate = div_u64((u64)kqd->qt_rate * kqd->qt_beta,
+					    100);
+			next_rate = max_t(u32, next_rate, 1);
+			rate_changed = kyber_qt_set_rate_locked(kqd, next_rate, now);
+		}
+	}
+
+	kqd->qt_prev_q = q_adm;
+	kqd->qt_prev_ns = now;
+	if (valid_sample || !kqd->qt_prev_domain_blocked)
+		kqd->qt_prev_domain_blocked = domain_blocked;
+	current_rate = kqd->qt_rate;
+	draining = kqd->qt_mode == KYBER_QT_DRAIN;
+	run_queues = rate_changed && b_new;
+out:
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+
+	if (rate_changed)
+		trace_kyber_qt_rate(kqd->dev, current_rate, q_adm, growth_rate,
+				    draining);
+	if (run_queues && !READ_ONCE(kqd->qt_stopping))
+		blk_mq_run_hw_queues(kqd->q, true);
+	if (!READ_ONCE(kqd->qt_stopping))
+		hrtimer_start(&kqd->qt_sample_timer,
+			      ms_to_ktime(READ_ONCE(kqd->qt_sample_ms)),
+			      HRTIMER_MODE_REL);
+}
 
 static int kyber_domain_wake(wait_queue_entry_t *wait, unsigned mode, int flags,
 			     void *key);
@@ -368,6 +599,26 @@ static struct kyber_queue_data *kyber_queue_data_alloc(struct request_queue *q)
 
 	kqd->q = q;
 	kqd->dev = disk_devt(q->disk);
+	spin_lock_init(&kqd->qt_lock);
+	kqd->qt_rate = KYBER_QT_DEFAULT_RATE;
+	kqd->qt_initial_rate = KYBER_QT_DEFAULT_RATE;
+	kqd->qt_max_rate = KYBER_QT_MAX_RATE;
+	kqd->qt_alpha = 10000;
+	kqd->qt_beta = 50;
+	kqd->qt_epsilon = 500;
+	kqd->qt_confirm = 3;
+	kqd->qt_sample_ms = 10;
+	kqd->qt_burst = KYBER_QT_DEFAULT_BURST;
+	kqd->qt_cap = KYBER_QT_DEFAULT_CAP;
+	kqd->qt_low = 48;
+	kqd->qt_high = 96;
+	kqd->qt_mode = KYBER_QT_TRACK;
+	kqd->qt_last_ns = ktime_get_ns();
+	hrtimer_init(&kqd->qt_wake_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	kqd->qt_wake_timer.function = kyber_qt_wake_timer_fn;
+	hrtimer_init(&kqd->qt_sample_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	kqd->qt_sample_timer.function = kyber_qt_sample_timer_fn;
+	INIT_WORK(&kqd->qt_sample_work, kyber_qt_sample_workfn);
 
 	kqd->cpu_latency = alloc_percpu_gfp(struct kyber_cpu_latency,
 					    GFP_KERNEL | __GFP_ZERO);
@@ -418,6 +669,7 @@ static int kyber_init_sched(struct request_queue *q, struct elevator_type *e)
 		kobject_put(&eq->kobj);
 		return PTR_ERR(kqd);
 	}
+	kqd->qt_enabled = !strcmp(e->elevator_name, "kyber-qt");
 
 	blk_stat_enable_accounting(q);
 
@@ -425,6 +677,9 @@ static int kyber_init_sched(struct request_queue *q, struct elevator_type *e)
 
 	eq->elevator_data = kqd;
 	q->elevator = eq;
+	if (kqd->qt_enabled)
+		hrtimer_start(&kqd->qt_sample_timer,
+			      ms_to_ktime(kqd->qt_sample_ms), HRTIMER_MODE_REL);
 
 	return 0;
 }
@@ -434,6 +689,11 @@ static void kyber_exit_sched(struct elevator_queue *e)
 	struct kyber_queue_data *kqd = e->elevator_data;
 	int i;
 
+	WRITE_ONCE(kqd->qt_stopping, true);
+	hrtimer_cancel(&kqd->qt_wake_timer);
+	hrtimer_cancel(&kqd->qt_sample_timer);
+	cancel_work_sync(&kqd->qt_sample_work);
+	hrtimer_cancel(&kqd->qt_sample_timer);
 	del_timer_sync(&kqd->timer);
 	blk_stat_disable_accounting(kqd->q);
 
@@ -502,6 +762,7 @@ static int kyber_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 		INIT_LIST_HEAD(&khd->domain_wait[i].wait.entry);
 		atomic_set(&khd->wait_index[i], 0);
 	}
+	INIT_LIST_HEAD(&khd->retry_rqs);
 
 	khd->cur_domain = 0;
 	khd->batching = 0;
@@ -550,6 +811,7 @@ static void rq_clear_domain_token(struct kyber_queue_data *kqd,
 		sched_domain = kyber_sched_domain(rq->cmd_flags);
 		sbitmap_queue_clear(&kqd->domain_tokens[sched_domain], nr,
 				    rq->mq_ctx->cpu);
+		rq_set_domain_token(rq, -1);
 	}
 }
 
@@ -584,15 +846,92 @@ static bool kyber_bio_merge(struct request_queue *q, struct bio *bio,
 	return merged;
 }
 
+static void kyber_qt_track_request(struct kyber_queue_data *kqd,
+				   struct request *rq)
+{
+	unsigned long flags, state;
+
+	if (!kqd->qt_enabled || !(rq->rq_flags & RQF_ELVPRIV))
+		return;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	state = kyber_qt_rq_state(rq);
+	if (!(state & KYBER_QT_TRACKED)) {
+		state |= KYBER_QT_TRACKED;
+		kyber_qt_set_rq_state(rq, state);
+		kqd->qt_generated++;
+		kqd->qt_b_new++;
+	}
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+}
+
+static void kyber_qt_finish_request(struct kyber_queue_data *kqd,
+				    struct request *rq, bool completed)
+{
+	unsigned long flags, state;
+
+	if (!kqd->qt_enabled)
+		return;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	state = kyber_qt_rq_state(rq);
+	if (!(state & KYBER_QT_TRACKED) || (state & KYBER_QT_TERMINAL))
+		goto out;
+
+	if (state & KYBER_QT_RETRY) {
+		if (kqd->qt_b_retry)
+			kqd->qt_b_retry--;
+		state &= ~KYBER_QT_RETRY;
+	}
+	if (state & KYBER_QT_ADMITTED) {
+		if (kqd->qt_q_adm)
+			kqd->qt_q_adm--;
+		if (completed)
+			kqd->qt_completed++;
+		else
+			kqd->qt_exit_admitted++;
+	} else {
+		if (kqd->qt_b_new)
+			kqd->qt_b_new--;
+		kqd->qt_exit_new++;
+	}
+	state |= KYBER_QT_TERMINAL;
+	kyber_qt_set_rq_state(rq, state);
+out:
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+}
+
+static void kyber_qt_requeue_request(struct kyber_queue_data *kqd,
+				     struct request *rq)
+{
+	unsigned long flags, state;
+
+	if (!kqd->qt_enabled)
+		return;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	state = kyber_qt_rq_state(rq);
+	if ((state & KYBER_QT_TRACKED) && (state & KYBER_QT_ADMITTED) &&
+	    !(state & (KYBER_QT_RETRY | KYBER_QT_TERMINAL))) {
+		state |= KYBER_QT_RETRY;
+		kyber_qt_set_rq_state(rq, state);
+		kqd->qt_b_retry++;
+		kqd->qt_requeues++;
+	}
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+}
+
 static void kyber_prepare_request(struct request *rq)
 {
 	rq_set_domain_token(rq, -1);
+	kyber_qt_set_rq_state(rq, 0);
 }
 
 static void kyber_insert_requests(struct blk_mq_hw_ctx *hctx,
 				  struct list_head *rq_list, bool at_head)
 {
 	struct kyber_hctx_data *khd = hctx->sched_data;
+	struct kyber_queue_data *kqd = hctx->queue->elevator->elevator_data;
 	struct request *rq, *next;
 
 	list_for_each_entry_safe(rq, next, rq_list, queuelist) {
@@ -600,6 +939,17 @@ static void kyber_insert_requests(struct blk_mq_hw_ctx *hctx,
 		struct kyber_ctx_queue *kcq = &khd->kcqs[rq->mq_ctx->index_hw[hctx->type]];
 		struct list_head *head = &kcq->rq_list[sched_domain];
 
+		kyber_qt_track_request(kqd, rq);
+		if (kqd->qt_enabled &&
+		    (kyber_qt_rq_state(rq) & KYBER_QT_RETRY)) {
+			spin_lock(&khd->lock);
+			if (at_head)
+				list_move(&rq->queuelist, &khd->retry_rqs);
+			else
+				list_move_tail(&rq->queuelist, &khd->retry_rqs);
+			spin_unlock(&khd->lock);
+			continue;
+		}
 		spin_lock(&kcq->lock);
 		trace_block_rq_insert(rq);
 		if (at_head)
@@ -617,6 +967,15 @@ static void kyber_finish_request(struct request *rq)
 	struct kyber_queue_data *kqd = rq->q->elevator->elevator_data;
 
 	rq_clear_domain_token(kqd, rq);
+	kyber_qt_finish_request(kqd, rq, false);
+}
+
+static void kyber_requeue_request(struct request *rq)
+{
+	struct kyber_queue_data *kqd = rq->q->elevator->elevator_data;
+
+	rq_clear_domain_token(kqd, rq);
+	kyber_qt_requeue_request(kqd, rq);
 }
 
 static void add_latency_sample(struct kyber_cpu_latency *cpu_latency,
@@ -643,6 +1002,11 @@ static void kyber_completed_request(struct request *rq, u64 now)
 	struct kyber_cpu_latency *cpu_latency;
 	unsigned int sched_domain;
 	u64 target;
+
+	if (kqd->qt_enabled) {
+		kyber_qt_finish_request(kqd, rq, true);
+		return;
+	}
 
 	sched_domain = kyber_sched_domain(rq->cmd_flags);
 	if (sched_domain == KYBER_OTHER)
@@ -706,9 +1070,9 @@ static int kyber_domain_wake(wait_queue_entry_t *wqe, unsigned mode, int flags,
 
 static int kyber_get_domain_token(struct kyber_queue_data *kqd,
 				  struct kyber_hctx_data *khd,
-				  struct blk_mq_hw_ctx *hctx)
+				  struct blk_mq_hw_ctx *hctx,
+				  unsigned int sched_domain)
 {
-	unsigned int sched_domain = khd->cur_domain;
 	struct sbitmap_queue *domain_tokens = &kqd->domain_tokens[sched_domain];
 	struct sbq_wait *wait = &khd->domain_wait[sched_domain];
 	struct sbq_wait_state *ws;
@@ -751,6 +1115,107 @@ static int kyber_get_domain_token(struct kyber_queue_data *kqd,
 	return nr;
 }
 
+static bool kyber_qt_admit(struct kyber_queue_data *kqd, struct request *rq)
+{
+	unsigned long flags, state;
+	u64 now, elapsed, max_credit, add, delay_ns = 0;
+	u64 q_adm = 0;
+	const char *blocked_reason = NULL;
+	u32 rate = 0;
+	bool admitted = true;
+
+	if (!(rq->rq_flags & RQF_ELVPRIV))
+		return true;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	state = kyber_qt_rq_state(rq);
+	if (!(state & KYBER_QT_TRACKED))
+		goto out;
+
+	if (state & KYBER_QT_ADMITTED) {
+		if (state & KYBER_QT_RETRY) {
+			if (kqd->qt_b_retry)
+				kqd->qt_b_retry--;
+			state &= ~KYBER_QT_RETRY;
+			kyber_qt_set_rq_state(rq, state);
+		}
+		goto out;
+	}
+	if (!kqd->qt_control) {
+		if (kqd->qt_b_new)
+			kqd->qt_b_new--;
+		kqd->qt_q_adm++;
+		kqd->qt_admitted++;
+		state |= KYBER_QT_ADMITTED;
+		kyber_qt_set_rq_state(rq, state);
+		goto out;
+	}
+
+	now = ktime_get_ns();
+	max_credit = (u64)kqd->qt_burst * KYBER_QT_CREDIT_UNIT;
+	if (now > kqd->qt_last_ns) {
+		/* Bound multiplication even after a long idle period. */
+		elapsed = min_t(u64, now - kqd->qt_last_ns, NSEC_PER_SEC);
+		add = elapsed * kqd->qt_rate;
+		if (kqd->qt_credit >= max_credit)
+			kqd->qt_credit = max_credit;
+		else if (add >= max_credit - kqd->qt_credit)
+			kqd->qt_credit = max_credit;
+		else
+			kqd->qt_credit += add;
+		kqd->qt_last_ns = now;
+	}
+
+	if (kqd->qt_q_adm >= kqd->qt_cap) {
+		kqd->qt_cap_blocked++;
+		blocked_reason = "cap";
+		admitted = false;
+	} else if (!kqd->qt_rate ||
+		   kqd->qt_credit < KYBER_QT_CREDIT_UNIT) {
+		kqd->qt_rate_blocked++;
+		blocked_reason = "rate";
+		if (kqd->qt_rate)
+			delay_ns = DIV_ROUND_UP_ULL(KYBER_QT_CREDIT_UNIT -
+						    kqd->qt_credit,
+						    kqd->qt_rate);
+		admitted = false;
+	} else {
+		kqd->qt_credit -= KYBER_QT_CREDIT_UNIT;
+		if (kqd->qt_b_new)
+			kqd->qt_b_new--;
+		kqd->qt_q_adm++;
+		kqd->qt_admitted++;
+		state |= KYBER_QT_ADMITTED;
+		kyber_qt_set_rq_state(rq, state);
+	}
+	q_adm = kqd->qt_q_adm;
+	rate = kqd->qt_rate;
+out:
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+
+	if (blocked_reason)
+		trace_kyber_qt_block(kqd->dev, blocked_reason, rate, q_adm);
+	if (delay_ns && !READ_ONCE(kqd->qt_stopping))
+		hrtimer_start(&kqd->qt_wake_timer,
+			      ns_to_ktime(max_t(u64, delay_ns, 1)),
+			      HRTIMER_MODE_REL);
+	return admitted;
+}
+
+static void kyber_qt_domain_blocked(struct kyber_queue_data *kqd)
+{
+	unsigned long flags;
+	u64 q_adm;
+	u32 rate;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	kqd->qt_domain_blocked++;
+	q_adm = kqd->qt_q_adm;
+	rate = kqd->qt_rate;
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	trace_kyber_qt_block(kqd->dev, "domain", rate, q_adm);
+}
+
 static struct request *
 kyber_dispatch_cur_domain(struct kyber_queue_data *kqd,
 			  struct kyber_hctx_data *khd,
@@ -772,26 +1237,40 @@ kyber_dispatch_cur_domain(struct kyber_queue_data *kqd,
 	 */
 	rq = list_first_entry_or_null(rqs, struct request, queuelist);
 	if (rq) {
-		nr = kyber_get_domain_token(kqd, khd, hctx);
+		nr = kyber_get_domain_token(kqd, khd, hctx, khd->cur_domain);
 		if (nr >= 0) {
+			if (kqd->qt_enabled && !kyber_qt_admit(kqd, rq)) {
+				sbitmap_queue_clear(&kqd->domain_tokens[khd->cur_domain],
+						    nr, rq->mq_ctx->cpu);
+				return NULL;
+			}
 			khd->batching++;
 			rq_set_domain_token(rq, nr);
 			list_del_init(&rq->queuelist);
 			return rq;
 		} else {
+			if (kqd->qt_enabled)
+				kyber_qt_domain_blocked(kqd);
 			trace_kyber_throttled(kqd->dev,
 					      kyber_domain_names[khd->cur_domain]);
 		}
 	} else if (sbitmap_any_bit_set(&khd->kcq_map[khd->cur_domain])) {
-		nr = kyber_get_domain_token(kqd, khd, hctx);
+		nr = kyber_get_domain_token(kqd, khd, hctx, khd->cur_domain);
 		if (nr >= 0) {
 			kyber_flush_busy_kcqs(khd, khd->cur_domain, rqs);
 			rq = list_first_entry(rqs, struct request, queuelist);
+			if (kqd->qt_enabled && !kyber_qt_admit(kqd, rq)) {
+				sbitmap_queue_clear(&kqd->domain_tokens[khd->cur_domain],
+						    nr, rq->mq_ctx->cpu);
+				return NULL;
+			}
 			khd->batching++;
 			rq_set_domain_token(rq, nr);
 			list_del_init(&rq->queuelist);
 			return rq;
 		} else {
+			if (kqd->qt_enabled)
+				kyber_qt_domain_blocked(kqd);
 			trace_kyber_throttled(kqd->dev,
 					      kyber_domain_names[khd->cur_domain]);
 		}
@@ -809,6 +1288,27 @@ static struct request *kyber_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	int i;
 
 	spin_lock(&khd->lock);
+
+	/* Retries retain admission and do not consume new rate credits. */
+	if (kqd->qt_enabled && !list_empty(&khd->retry_rqs)) {
+		unsigned int sched_domain;
+
+		rq = list_first_entry(&khd->retry_rqs, struct request, queuelist);
+		sched_domain = kyber_sched_domain(rq->cmd_flags);
+		i = kyber_get_domain_token(kqd, khd, hctx, sched_domain);
+		if (i >= 0) {
+			if (kyber_qt_admit(kqd, rq)) {
+				rq_set_domain_token(rq, i);
+				list_del_init(&rq->queuelist);
+				khd->batching = 0;
+				goto out;
+			}
+			sbitmap_queue_clear(&kqd->domain_tokens[sched_domain], i,
+					    rq->mq_ctx->cpu);
+		} else {
+			kyber_qt_domain_blocked(kqd);
+		}
+	}
 
 	/*
 	 * First, if we are still entitled to batch, try to dispatch a request
@@ -858,7 +1358,7 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 			return true;
 	}
 
-	return false;
+	return !list_empty_careful(&khd->retry_rqs);
 }
 
 #define KYBER_LAT_SHOW_STORE(domain, name)				\
@@ -896,6 +1396,418 @@ static struct elv_fs_entry kyber_sched_attrs[] = {
 	__ATTR_NULL
 };
 #undef KYBER_LAT_ATTR
+
+static ssize_t kyber_qt_rate_show(struct elevator_queue *e, char *page)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 rate;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	rate = kqd->qt_rate;
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return sysfs_emit(page, "%u\n", rate);
+}
+
+static ssize_t kyber_qt_rate_store(struct elevator_queue *e,
+				   const char *page, size_t count)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 rate;
+	int ret;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	ret = kstrtouint(page, 10, &rate);
+	if (ret)
+		return ret;
+	if (rate > KYBER_QT_MAX_RATE)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	if (rate > kqd->qt_max_rate) {
+		spin_unlock_irqrestore(&kqd->qt_lock, flags);
+		return -EINVAL;
+	}
+	kqd->qt_rate = rate;
+	kqd->qt_initial_rate = rate;
+	kqd->qt_credit = 0;
+	kqd->qt_last_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	blk_mq_run_hw_queues(kqd->q, true);
+	return count;
+}
+
+static ssize_t kyber_qt_cap_show(struct elevator_queue *e, char *page)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 cap;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	cap = kqd->qt_cap;
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return sysfs_emit(page, "%u\n", cap);
+}
+
+static ssize_t kyber_qt_cap_store(struct elevator_queue *e,
+				  const char *page, size_t count)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 cap;
+	int ret;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	ret = kstrtouint(page, 10, &cap);
+	if (ret)
+		return ret;
+	if (!cap || cap > KYBER_QT_MAX_CAP)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	if (cap <= kqd->qt_high) {
+		spin_unlock_irqrestore(&kqd->qt_lock, flags);
+		return -EINVAL;
+	}
+	if (cap < kqd->qt_q_adm) {
+		spin_unlock_irqrestore(&kqd->qt_lock, flags);
+		return -EBUSY;
+	}
+	kqd->qt_cap = cap;
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	blk_mq_run_hw_queues(kqd->q, true);
+	return count;
+}
+
+static ssize_t kyber_qt_burst_show(struct elevator_queue *e, char *page)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 burst;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	burst = kqd->qt_burst;
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return sysfs_emit(page, "%u\n", burst);
+}
+
+static ssize_t kyber_qt_burst_store(struct elevator_queue *e,
+				    const char *page, size_t count)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u64 max_credit;
+	u32 burst;
+	int ret;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	ret = kstrtouint(page, 10, &burst);
+	if (ret)
+		return ret;
+	if (!burst || burst > KYBER_QT_MAX_BURST)
+		return -EINVAL;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	kqd->qt_burst = burst;
+	max_credit = (u64)burst * KYBER_QT_CREDIT_UNIT;
+	kqd->qt_credit = min(kqd->qt_credit, max_credit);
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return count;
+}
+
+enum kyber_qt_attribute {
+	KYBER_QT_CONTROL,
+	KYBER_QT_MAX_RATE_ATTR,
+	KYBER_QT_ALPHA,
+	KYBER_QT_BETA,
+	KYBER_QT_EPSILON,
+	KYBER_QT_CONFIRM,
+	KYBER_QT_SAMPLE_MS,
+	KYBER_QT_LOW,
+	KYBER_QT_HIGH,
+};
+
+static ssize_t kyber_qt_parameter_show(struct elevator_queue *e, char *page,
+				       enum kyber_qt_attribute attribute)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	u32 value;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	switch (attribute) {
+	case KYBER_QT_CONTROL:
+		value = kqd->qt_control;
+		break;
+	case KYBER_QT_MAX_RATE_ATTR:
+		value = kqd->qt_max_rate;
+		break;
+	case KYBER_QT_ALPHA:
+		value = kqd->qt_alpha;
+		break;
+	case KYBER_QT_BETA:
+		value = kqd->qt_beta;
+		break;
+	case KYBER_QT_EPSILON:
+		value = kqd->qt_epsilon;
+		break;
+	case KYBER_QT_CONFIRM:
+		value = kqd->qt_confirm;
+		break;
+	case KYBER_QT_SAMPLE_MS:
+		value = kqd->qt_sample_ms;
+		break;
+	case KYBER_QT_LOW:
+		value = kqd->qt_low;
+		break;
+	case KYBER_QT_HIGH:
+		value = kqd->qt_high;
+		break;
+	default:
+		value = 0;
+		break;
+	}
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return sysfs_emit(page, "%u\n", value);
+}
+
+static ssize_t kyber_qt_parameter_store(struct elevator_queue *e,
+					const char *page, size_t count,
+					enum kyber_qt_attribute attribute)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	bool restart_sample = false, wake_queues = false;
+	u32 value;
+	int ret;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	ret = kstrtouint(page, 10, &value);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	if (kqd->qt_q_adm || kqd->qt_b_new) {
+		ret = -EBUSY;
+		goto out;
+	}
+	switch (attribute) {
+	case KYBER_QT_CONTROL:
+		if (value > 2) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_control = value;
+		kqd->qt_mode = KYBER_QT_TRACK;
+		kqd->qt_growth_streak = 0;
+		kqd->qt_drain_streak = 0;
+		kqd->qt_prev_ns = 0;
+		if (value < 2)
+			kyber_qt_set_rate_locked(kqd, kqd->qt_initial_rate,
+						 ktime_get_ns());
+		wake_queues = true;
+		break;
+	case KYBER_QT_MAX_RATE_ATTR:
+		if (!value || value > KYBER_QT_MAX_RATE ||
+		    value < kqd->qt_rate ||
+		    value < kqd->qt_initial_rate) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_max_rate = value;
+		break;
+	case KYBER_QT_ALPHA:
+		if (value > KYBER_QT_MAX_RATE) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_alpha = value;
+		break;
+	case KYBER_QT_BETA:
+		if (!value || value >= 100) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_beta = value;
+		break;
+	case KYBER_QT_EPSILON:
+		if (value > KYBER_QT_MAX_RATE) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_epsilon = value;
+		break;
+	case KYBER_QT_CONFIRM:
+		if (!value || value > KYBER_QT_MAX_CONFIRM) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_confirm = value;
+		break;
+	case KYBER_QT_SAMPLE_MS:
+		if (!value || value > 1000) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_sample_ms = value;
+		restart_sample = kqd->qt_enabled;
+		break;
+	case KYBER_QT_LOW:
+		if (value >= kqd->qt_high) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_low = value;
+		break;
+	case KYBER_QT_HIGH:
+		if (value <= kqd->qt_low || value >= kqd->qt_cap) {
+			ret = -EINVAL;
+			goto out;
+		}
+		kqd->qt_high = value;
+		break;
+	default:
+		ret = -EINVAL;
+		goto out;
+	}
+	kqd->qt_mode = KYBER_QT_TRACK;
+	kqd->qt_growth_streak = 0;
+	kqd->qt_drain_streak = 0;
+	kqd->qt_prev_ns = 0;
+	kqd->qt_prev_domain_blocked = kqd->qt_domain_blocked;
+	kqd->qt_sample_valid = false;
+	ret = count;
+out:
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	if (ret < 0)
+		return ret;
+	if (restart_sample && !READ_ONCE(kqd->qt_stopping))
+		hrtimer_start(&kqd->qt_sample_timer,
+			      ms_to_ktime(READ_ONCE(kqd->qt_sample_ms)),
+			      HRTIMER_MODE_REL);
+	if (wake_queues)
+		blk_mq_run_hw_queues(kqd->q, true);
+	return count;
+}
+
+#define KYBER_QT_PARAM_SHOW(name, param) \
+static ssize_t kyber_qt_##name##_show(struct elevator_queue *e, char *page) \
+{ \
+	return kyber_qt_parameter_show(e, page, param); \
+}
+
+#define KYBER_QT_PARAM_STORE(name, param) \
+static ssize_t kyber_qt_##name##_store(struct elevator_queue *e, \
+					       const char *page, size_t count) \
+{ \
+	return kyber_qt_parameter_store(e, page, count, param); \
+}
+
+KYBER_QT_PARAM_SHOW(control, KYBER_QT_CONTROL)
+KYBER_QT_PARAM_STORE(control, KYBER_QT_CONTROL)
+KYBER_QT_PARAM_SHOW(max_rate, KYBER_QT_MAX_RATE_ATTR)
+KYBER_QT_PARAM_STORE(max_rate, KYBER_QT_MAX_RATE_ATTR)
+KYBER_QT_PARAM_SHOW(alpha, KYBER_QT_ALPHA)
+KYBER_QT_PARAM_STORE(alpha, KYBER_QT_ALPHA)
+KYBER_QT_PARAM_SHOW(beta, KYBER_QT_BETA)
+KYBER_QT_PARAM_STORE(beta, KYBER_QT_BETA)
+KYBER_QT_PARAM_SHOW(epsilon, KYBER_QT_EPSILON)
+KYBER_QT_PARAM_STORE(epsilon, KYBER_QT_EPSILON)
+KYBER_QT_PARAM_SHOW(confirm, KYBER_QT_CONFIRM)
+KYBER_QT_PARAM_STORE(confirm, KYBER_QT_CONFIRM)
+KYBER_QT_PARAM_SHOW(sample_ms, KYBER_QT_SAMPLE_MS)
+KYBER_QT_PARAM_STORE(sample_ms, KYBER_QT_SAMPLE_MS)
+KYBER_QT_PARAM_SHOW(low, KYBER_QT_LOW)
+KYBER_QT_PARAM_STORE(low, KYBER_QT_LOW)
+KYBER_QT_PARAM_SHOW(high, KYBER_QT_HIGH)
+KYBER_QT_PARAM_STORE(high, KYBER_QT_HIGH)
+#undef KYBER_QT_PARAM_SHOW
+#undef KYBER_QT_PARAM_STORE
+
+static ssize_t kyber_qt_stats_show(struct elevator_queue *e, char *page)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	unsigned long flags;
+	ssize_t len;
+
+	if (!kqd->qt_enabled)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&kqd->qt_lock, flags);
+	len = sysfs_emit(page,
+			 "G=%llu A=%llu C=%llu X_B=%llu X_Q=%llu B_new=%llu Q_adm=%llu\n",
+		(unsigned long long)kqd->qt_generated,
+		(unsigned long long)kqd->qt_admitted,
+		(unsigned long long)kqd->qt_completed,
+		(unsigned long long)kqd->qt_exit_new,
+		(unsigned long long)kqd->qt_exit_admitted,
+		(unsigned long long)kqd->qt_b_new,
+		(unsigned long long)kqd->qt_q_adm);
+	len += sysfs_emit_at(page, len,
+			    "B_retry=%llu rate=%u burst=%u cap=%u\n",
+		(unsigned long long)kqd->qt_b_retry,
+		kqd->qt_rate, kqd->qt_burst, kqd->qt_cap);
+	len += sysfs_emit_at(page, len,
+			    "credit_nano_requests=%llu\n",
+		(unsigned long long)kqd->qt_credit);
+	len += sysfs_emit_at(page, len,
+			    "rate_blocked=%llu cap_blocked=%llu domain_blocked=%llu requeues=%llu\n",
+		(unsigned long long)kqd->qt_rate_blocked,
+		(unsigned long long)kqd->qt_cap_blocked,
+		(unsigned long long)kqd->qt_domain_blocked,
+		(unsigned long long)kqd->qt_requeues);
+	len += sysfs_emit_at(page, len,
+			    "mode=%s control=%u growth=%lld\n",
+		kqd->qt_mode == KYBER_QT_DRAIN ? "DRAIN" : "TRACK",
+		kqd->qt_control, (long long)kqd->qt_growth_rate);
+	len += sysfs_emit_at(page, len,
+			    "sample_valid=%u sample_elapsed_ns=%llu\n",
+		kqd->qt_sample_valid,
+		(unsigned long long)kqd->qt_sample_elapsed_ns);
+	len += sysfs_emit_at(page, len,
+			    "epsilon=%u low=%u high=%u alpha=%u beta=%u\n",
+		kqd->qt_epsilon, kqd->qt_low, kqd->qt_high, kqd->qt_alpha,
+		kqd->qt_beta);
+	len += sysfs_emit_at(page, len,
+			    "confirm=%u sample_ms=%u max_rate=%u\n",
+		kqd->qt_confirm, kqd->qt_sample_ms, kqd->qt_max_rate);
+	spin_unlock_irqrestore(&kqd->qt_lock, flags);
+	return len;
+}
+
+static struct elv_fs_entry kyber_qt_sched_attrs[] = {
+	__ATTR(qt_rate, 0644, kyber_qt_rate_show, kyber_qt_rate_store),
+	__ATTR(qt_burst, 0644, kyber_qt_burst_show, kyber_qt_burst_store),
+	__ATTR(qt_cap, 0644, kyber_qt_cap_show, kyber_qt_cap_store),
+	__ATTR(qt_control, 0644, kyber_qt_control_show,
+	       kyber_qt_control_store),
+	__ATTR(qt_max_rate, 0644, kyber_qt_max_rate_show,
+	       kyber_qt_max_rate_store),
+	__ATTR(qt_alpha, 0644, kyber_qt_alpha_show, kyber_qt_alpha_store),
+	__ATTR(qt_beta, 0644, kyber_qt_beta_show, kyber_qt_beta_store),
+	__ATTR(qt_epsilon, 0644, kyber_qt_epsilon_show,
+	       kyber_qt_epsilon_store),
+	__ATTR(qt_confirm, 0644, kyber_qt_confirm_show,
+	       kyber_qt_confirm_store),
+	__ATTR(qt_sample_ms, 0644, kyber_qt_sample_ms_show,
+	       kyber_qt_sample_ms_store),
+	__ATTR(qt_low, 0644, kyber_qt_low_show, kyber_qt_low_store),
+	__ATTR(qt_high, 0644, kyber_qt_high_show, kyber_qt_high_store),
+	__ATTR(qt_stats, 0444, kyber_qt_stats_show, NULL),
+	__ATTR_NULL
+};
 
 #ifdef CONFIG_BLK_DEBUG_FS
 #define KYBER_DEBUGFS_DOMAIN_ATTRS(domain, name)			\
@@ -1038,13 +1950,48 @@ static struct elevator_type kyber_sched = {
 	.elevator_owner = THIS_MODULE,
 };
 
+static struct elevator_type kyber_qt_sched = {
+	.ops = {
+		.init_sched = kyber_init_sched,
+		.exit_sched = kyber_exit_sched,
+		.init_hctx = kyber_init_hctx,
+		.exit_hctx = kyber_exit_hctx,
+		.limit_depth = kyber_limit_depth,
+		.bio_merge = kyber_bio_merge,
+		.prepare_request = kyber_prepare_request,
+		.insert_requests = kyber_insert_requests,
+		.finish_request = kyber_finish_request,
+		.requeue_request = kyber_requeue_request,
+		.completed_request = kyber_completed_request,
+		.dispatch_request = kyber_dispatch_request,
+		.has_work = kyber_has_work,
+		.depth_updated = kyber_depth_updated,
+	},
+#ifdef CONFIG_BLK_DEBUG_FS
+	.queue_debugfs_attrs = kyber_queue_debugfs_attrs,
+	.hctx_debugfs_attrs = kyber_hctx_debugfs_attrs,
+#endif
+	.elevator_attrs = kyber_qt_sched_attrs,
+	.elevator_name = "kyber-qt",
+	.elevator_owner = THIS_MODULE,
+};
+
 static int __init kyber_init(void)
 {
-	return elv_register(&kyber_sched);
+	int ret;
+
+	ret = elv_register(&kyber_sched);
+	if (ret)
+		return ret;
+	ret = elv_register(&kyber_qt_sched);
+	if (ret)
+		elv_unregister(&kyber_sched);
+	return ret;
 }
 
 static void __exit kyber_exit(void)
 {
+	elv_unregister(&kyber_qt_sched);
 	elv_unregister(&kyber_sched);
 }
 

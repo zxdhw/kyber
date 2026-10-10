@@ -6,6 +6,7 @@
 #define _TRACE_KYBER_H
 
 #include <linux/blkdev.h>
+#include <linux/string.h>
 #include <linux/tracepoint.h>
 
 #define DOMAIN_LEN		16
@@ -86,6 +87,61 @@ TRACE_EVENT(kyber_throttled,
 
 	TP_printk("%d,%d %s", MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->domain)
+);
+
+TRACE_EVENT(kyber_qt_block,
+
+	TP_PROTO(dev_t dev, const char *reason, unsigned int rate, u64 q_adm),
+
+	TP_ARGS(dev, reason, rate, q_adm),
+
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__array(char, reason, 8)
+		__field(unsigned int, rate)
+		__field(u64, q_adm)
+	),
+
+	TP_fast_assign(
+		__entry->dev = dev;
+		strscpy(__entry->reason, reason, sizeof(__entry->reason));
+		__entry->rate = rate;
+		__entry->q_adm = q_adm;
+	),
+
+	TP_printk("%d,%d reason=%s rate=%u Q_adm=%llu",
+		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->reason,
+		  __entry->rate, (unsigned long long)__entry->q_adm)
+);
+
+TRACE_EVENT(kyber_qt_rate,
+
+	TP_PROTO(dev_t dev, unsigned int rate, u64 q_adm, s64 growth,
+		 bool draining),
+
+	TP_ARGS(dev, rate, q_adm, growth, draining),
+
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(unsigned int, rate)
+		__field(u64, q_adm)
+		__field(s64, growth)
+		__field(bool, draining)
+	),
+
+	TP_fast_assign(
+		__entry->dev = dev;
+		__entry->rate = rate;
+		__entry->q_adm = q_adm;
+		__entry->growth = growth;
+		__entry->draining = draining;
+	),
+
+	TP_printk("%d,%d rate=%u Q_adm=%llu growth=%lld mode=%s",
+		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->rate,
+		  (unsigned long long)__entry->q_adm,
+		  (unsigned long long)__entry->growth,
+		  __entry->draining ? "DRAIN" : "TRACK")
 );
 
 #define _TRACE_KYBER_H
