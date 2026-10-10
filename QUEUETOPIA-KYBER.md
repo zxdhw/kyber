@@ -74,8 +74,18 @@ Linux 6.1.53 source tree). `git diff` in this directory shows the integration
 changes relative to that baseline.
 
 The changed Kyber object compiled with `W=1` after generating an x86_64
-`defconfig`. This is a compile check only. No complete kernel build, boot,
-multi-hctx concurrency run, or retry/error injection has been performed. Before
-performance measurements, validate the target machine's config and kernel
-patches, then exercise accounting, zero-rate retries, cap behavior, and queue
-teardown on that build.
+`defconfig`. A separate minimal x86-64 kernel built from this commit also
+booted in QEMU 6.2 with TCG software emulation, one vCPU, 512 MiB RAM, and a
+disposable 32 MiB virtio block device. The smoke test selected `kyber-qt`,
+switched `qt_control` through 0, 1, and 2, issued concurrent direct writes
+from eight workers, and switched back to native `kyber`. All writes completed;
+the final QueueTopia counters were G=A=C=1088 with B_new=Q_adm=0, and the VM
+powered off cleanly without a kernel BUG, Oops, or panic.
+
+This confirms basic boot, scheduler selection, sysfs control, request
+accounting, and virtual block I/O only. The run used a single virtual queue;
+`cap_blocked` remained zero and the adaptive controller stayed in TRACK without
+changing its rate. It does not validate cap saturation, adaptive transitions,
+zero-rate retries, error/requeue injection, multi-hctx concurrency, or target
+hardware behavior. Validate the target machine's config and kernel patches
+before performance measurements, then exercise those cases on that build.
